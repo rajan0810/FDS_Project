@@ -1,6 +1,7 @@
 import sys
 import argparse
 import time
+import random
 import pandas as pd
 from src.config import CONFIG, get_gemini_api_key
 from src.dataset import load_qasper_dataset
@@ -260,9 +261,79 @@ def cmd_demo():
     print("==================================================")
     print(f"Final Adaptive Answer:\n{adapt_result['answer']}")
 
+def cmd_interactive():
+    print_separator("INTERACTIVE ADAPTIVE CONTEXT DEMO")
+    
+    ds = load_qasper_dataset()
+    sample = random.choice(ds)
+    pr = flatten_qasper_paper(sample)
+    
+    print(f"Paper Title: {sample['title']}")
+    print(f"Abstract: {sample['abstract']}\n")
+    print(f"Loaded {len(pr.paragraphs)} paragraphs from the paper.")
+    
+    # Print some example questions so the user doesn't have to invent one
+    print("\n💡 Example Questions you could ask:")
+    sample_questions = extract_questions(sample)
+    for i, q in enumerate(sample_questions[:3]):
+        print(f" {i+1}. {q.question}")
+    print()
+    
+    question = input("Ask a question about this paper: ")
+    
+    print("\n⸻\nSTEP 0 — VECTOR EMBEDDINGS\n⸻")
+    chunks = create_chunks(pr.paragraphs)
+    print(f"Converting {len(chunks)} text chunks into vectors...")
+    
+    emb_manager = EmbeddingManager()
+    chunk_embeddings, chunk_metadata = embed_chunks(chunks, emb_manager)
+    
+    print("⸻\nSTEP 1 — VECTOR SEARCH & RETRIEVAL\n⸻")
+    query_emb = emb_manager.get_embeddings([question])[0]
+    retrieved = retrieve(query_emb, chunk_embeddings, chunk_metadata, k=CONFIG["MAX_CHUNKS"])
+    
+    print(f"Top {CONFIG['MAX_CHUNKS']} candidates retrieved:")
+    for i, row in retrieved.iterrows():
+        print(f"{row['rank']}. {row['chunk_id']} | score={row['similarity_score']:.3f}")
+    
+    print("⸻\nSTEP 2 — REDUNDANCY\n⸻")
+    retrieved_embeddings = chunk_embeddings[retrieved.index.tolist()]
+    retrieved_ids = retrieved["chunk_id"].tolist()
+    redundancy_pairs = calculate_pairwise_redundancy(retrieved_embeddings, retrieved_ids)
+    
+    redundant_only = [p for p in redundancy_pairs if p[3]]
+    non_redundant = [p for p in redundancy_pairs if not p[3]]
+    
+    # Print a few non-redundant examples
+    for id1, id2, score, _ in non_redundant[:5]:
+        print(f"{id1} <-> {id2} = {score:.2f} | No redundancy")
+        
+    if len(non_redundant) > 5:
+        print(f"... and {len(non_redundant) - 5} more non-redundant pairs")
+        
+    # Always print the redundant pairs
+    for id1, id2, score, _ in redundant_only:
+        print(f"{id1} <-> {id2} = {score:.2f} | Potential redundancy: YES")
+        
+    if not redundant_only:
+        print("-> No chunks breached the redundancy threshold.")
+        
+    print("⸻\nSTEP 3 — ADAPTIVE SELECTION\n⸻")
+    selected_context_df, removed = adaptive_select(retrieved, chunk_embeddings, chunk_metadata)
+    print(f"Candidates considered: {len(retrieved)}")
+    print(f"Selected: {len(selected_context_df)}")
+    print(f"Removed as redundant: {removed}")
+    
+    print("⸻\nSTEP 4 — GEMINI ANSWER\n⸻")
+    context_text = "\n\n".join(selected_context_df["text"].tolist())
+    gen_result = generate_answer(question, context_text)
+    
+    print(f"\nFinal Adaptive Answer:\n{gen_result['answer']}\n")
+    print(f"Latency: {gen_result['latency']:.2f} seconds")
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python main.py [setup|inspect|eda|demo]")
+        print("Usage: python main.py [setup|inspect|eda|demo|interactive]")
         sys.exit(1)
         
     cmd = sys.argv[1]
@@ -275,6 +346,8 @@ def main():
         cmd_eda()
     elif cmd == "demo":
         cmd_demo()
+    elif cmd == "interactive":
+        cmd_interactive()
     else:
         print(f"Unknown command: {cmd}")
 
