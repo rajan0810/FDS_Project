@@ -4,25 +4,40 @@ from typing import List, Tuple
 from sklearn.metrics.pairwise import cosine_similarity
 from .config import CONFIG
 
-def flag_redundant_chunks(retrieved_metadata: pd.DataFrame, chunk_embeddings: np.ndarray, threshold: float = None) -> List[Tuple[str, str, float]]:
+def flag_redundant_chunks(candidates: pd.DataFrame, candidate_embeddings: np.ndarray, threshold: float = None) -> Tuple[pd.DataFrame, int]:
+    """
+    Redundancy Removal pipeline stage.
+
+    Given a set of already relevance-ranked candidate chunks (highest relevance first)
+    and their embeddings (aligned row-for-row with `candidates`), greedily keep a chunk
+    unless its cosine similarity to any already-kept chunk is >= threshold. This removes
+    near-duplicate/semantically-redundant chunks while preserving the higher-relevance
+    chunk of any redundant pair.
+
+    Returns (deduplicated_dataframe, num_removed_as_redundant).
+    """
     if threshold is None:
         threshold = CONFIG["REDUNDANCY_THRESHOLD"]
-        
-    redundant_pairs = []
-    
-    if len(retrieved_metadata) < 2:
-        return redundant_pairs
-        
-    # Get embeddings for just the retrieved chunks
-    retrieved_indices = retrieved_metadata.index
-    # We assume the chunk_embeddings passed here are aligned with the global chunk index,
-    # and the retrieved_metadata index contains the original global indices.
-    # Wait, in retrieve(), retrieved_metadata is a copy of original metadata. 
-    # Let's just use the chunk IDs to find the correct embeddings or re-embed.
-    # Actually, it's easier to pass the embeddings of the retrieved chunks directly.
-    pass
-    
-    return redundant_pairs
+
+    if len(candidates) < 2:
+        return candidates.copy(), 0
+
+    keep_positions = []
+    kept_embeddings = []
+    removed = 0
+
+    for pos in range(len(candidates)):
+        emb = candidate_embeddings[pos].reshape(1, -1)
+        if kept_embeddings:
+            sims = cosine_similarity(emb, np.vstack(kept_embeddings))[0]
+            if np.max(sims) >= threshold:
+                removed += 1
+                continue
+        keep_positions.append(pos)
+        kept_embeddings.append(candidate_embeddings[pos])
+
+    deduplicated = candidates.iloc[keep_positions].copy()
+    return deduplicated, removed
 
 def calculate_pairwise_redundancy(retrieved_embeddings: np.ndarray, retrieved_ids: List[str], threshold: float = None) -> List[Tuple[str, str, float, bool]]:
     if threshold is None:

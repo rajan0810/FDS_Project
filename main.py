@@ -2,6 +2,7 @@ import sys
 import argparse
 import time
 import random
+import numpy as np
 import pandas as pd
 from src.config import CONFIG, get_gemini_api_key
 from src.dataset import load_qasper_dataset
@@ -9,11 +10,19 @@ from src.preprocessing import flatten_qasper_paper, extract_questions
 from src.chunking import create_chunks
 from src.embeddings import EmbeddingManager, embed_chunks, save_embeddings, load_embeddings
 from src.retrieval import retrieve, map_gold_evidence_to_chunks
-from src.redundancy import flag_redundant_chunks, calculate_pairwise_redundancy
+from src.redundancy import calculate_pairwise_redundancy
+from src.reranking import Reranker
 from src.adaptive_selection import adaptive_select
 from src.generation import generate_answer
 from src.evaluation import evaluate_answer, calculate_retrieval_metrics
-from src.eda import analyze_context_lengths, analyze_evidence_positions
+from src.eda import (
+    analyze_context_lengths, analyze_evidence_positions,
+    analyze_relevance, analyze_redundancy, analyze_cross_document_similarity,
+)
+from src.experiments import run_experiment_sweep
+
+random.seed(CONFIG["RANDOM_SEED"])
+np.random.seed(CONFIG["RANDOM_SEED"])
 
 def print_separator(title=None):
     print("=" * 50)
@@ -75,42 +84,116 @@ def cmd_inspect():
 def cmd_eda():
     print_separator("EDA RUN")
     ds = load_qasper_dataset()
-    
+
     max_papers = CONFIG["MAX_PAPERS_DEMO"]
     paper_records = []
     question_records = []
     chunk_records = []
-    
+
     print(f"Processing {max_papers} papers for EDA...")
     for i in range(min(max_papers, len(ds))):
         sample = ds[i]
         pr = flatten_qasper_paper(sample)
         qr = extract_questions(sample)
         cr = create_chunks(pr.paragraphs)
-        
+
         paper_records.append(pr)
         question_records.extend(qr)
         chunk_records.extend(cr)
-        
+
     print("⸻\n1. Context Length Analysis\n⸻")
     print("Analyze document and token-length distributions...")
     stats = analyze_context_lengths(paper_records, question_records, chunk_records)
     print(stats)
-    
+
+    # Embed chunks once per paper so Relevance, Redundancy, and Cross-Document
+    # Similarity analyses can all reuse the same vectors.
+    emb_manager = EmbeddingManager()
+    paper_embeddings = {}
+    paper_chunk_data = {}
+    for pr in paper_records:
+        chunks = create_chunks(pr.paragraphs)
+        chunk_embeddings, chunk_metadata = embed_chunks(chunks, emb_manager)
+        paper_embeddings[pr.paper_id] = chunk_embeddings
+        paper_chunk_data[pr.paper_id] = chunk_metadata
+
     print("⸻\n2. Relevance Analysis\n⸻")
     print("Usefulness of available context for each query...")
-    total_q = len(question_records)
-    ans_q = sum(1 for q in question_records if q.evidence)
-    print(f"Total questions extracted: {total_q}")
-    print(f"Questions with gold evidence in context: {ans_q} ({(ans_q/total_q)*100:.1f}% context usefulness)")
-    
+    relevance_records = []
+    redundancy_records = []
+    sample_sim_matrix, sample_chunk_ids = None, None
+
+    for pr in paper_records:
+        chunk_embeddings = paper_embeddings[pr.paper_id]
+        chunk_metadata = paper_chunk_data[pr.paper_id]
+        if len(chunk_metadata) == 0:
+            continue
+
+        paper_questions = [q for q in question_records if q.paper_id == pr.paper_id]
+        for q in paper_questions:
+            query_emb = emb_manager.get_embeddings([q.question])[0]
+            retrieved = retrieve(query_emb, chunk_embeddings, chunk_metadata, k=CONFIG["MAX_CHUNKS"])
+            gold_chunk_ids = map_gold_evidence_to_chunks(q.evidence, pr.paragraphs, chunk_metadata)
+
+            relevance_records.append({
+                "question_id": q.question_id,
+                "avg_topk_similarity": float(retrieved["similarity_score"].mean()) if len(retrieved) else 0.0,
+                "max_similarity": float(retrieved["similarity_score"].max()) if len(retrieved) else 0.0,
+                "evidence_covered": bool(set(retrieved["chunk_id"]) & set(gold_chunk_ids)) if gold_chunk_ids else False,
+            })
+
+            retrieved_embeddings = chunk_embeddings[retrieved.index.tolist()]
+            retrieved_ids = retrieved["chunk_id"].tolist()
+            pairs = calculate_pairwise_redundancy(retrieved_embeddings, retrieved_ids)
+            num_redundant = sum(1 for p in pairs if p[3])
+            redundancy_records.append({
+                "question_id": q.question_id,
+                "num_pairs": len(pairs),
+                "num_redundant": num_redundant,
+                "redundancy_rate": (num_redundant / len(pairs)) if pairs else 0.0,
+            })
+
+            if sample_sim_matrix is None and len(retrieved_embeddings) >= 2:
+                from sklearn.metrics.pairwise import cosine_similarity
+                sample_sim_matrix = cosine_similarity(retrieved_embeddings)
+                sample_chunk_ids = retrieved_ids
+
+    relevance_df = analyze_relevance(relevance_records)
+    if len(relevance_df):
+        coverage_pct = 100 * relevance_df["evidence_covered"].mean()
+        print(f"Questions analyzed: {len(relevance_df)}")
+        print(f"Average top-K retrieval similarity: {relevance_df['avg_topk_similarity'].mean():.3f}")
+        print(f"Gold-evidence retrieval coverage: {coverage_pct:.1f}%")
+
     print("⸻\n3. Evidence Position Analysis\n⸻")
     print("Study whether relevant information occurs at beginning, middle, or end of long contexts...")
     pos_stats = analyze_evidence_positions(paper_records, question_records, chunk_records)
     for pos, count in pos_stats.items():
         print(f" - {pos}: {count} occurrences")
-    
+
+    print("⸻\n4. Redundancy Analysis\n⸻")
+    print("Identify duplicate or semantically similar information...")
+    redundancy_df = analyze_redundancy(redundancy_records, sample_sim_matrix, sample_chunk_ids)
+    if len(redundancy_df):
+        print(f"Average redundancy rate among retrieved chunks: {redundancy_df['redundancy_rate'].mean()*100:.1f}%")
+
+    print("⸻\n5. Cross-Document Similarity Analysis\n⸻")
+    print("Measure context similarity between different papers in the corpus...")
+    paper_ids = [pid for pid, emb in paper_embeddings.items() if len(emb) > 0]
+    paper_vectors = np.array([paper_embeddings[pid].mean(axis=0) for pid in paper_ids])
+    cross_doc_df = analyze_cross_document_similarity(paper_ids, paper_vectors)
+    if len(cross_doc_df):
+        print(f"Paper pairs compared: {len(cross_doc_df)}")
+        print(f"Average cross-document similarity: {cross_doc_df['similarity'].mean():.3f}")
+
     print("EDA plots saved to outputs/eda/figures/")
+
+def cmd_experiment(num_samples=None):
+    print_separator("EXPERIMENT SWEEP: Context-vs-Accuracy, Latency, Cost-Quality Tradeoff")
+    results = run_experiment_sweep(num_samples)
+    print("\nCost-Quality Tradeoff Summary (per configuration):")
+    print(results["cost_quality_tradeoff"].to_string(index=False))
+    print("\nArtifacts saved to outputs/experiments/")
 
 def cmd_demo():
     print_separator("ADAPTIVE CONTEXT SELECTION DEMO")
@@ -164,12 +247,20 @@ def cmd_demo():
     
     retrieved = retrieve(query_emb, chunk_embeddings, chunk_metadata, k=CONFIG["MAX_CHUNKS"])
     gold_chunk_ids = map_gold_evidence_to_chunks(qr.evidence, pr.paragraphs, chunk_metadata)
-    
+
     print(f"Top {CONFIG['MAX_CHUNKS']} candidates:")
     for i, row in retrieved.iterrows():
         is_relevant = "[RELEVANT]" if row["chunk_id"] in gold_chunk_ids else "[NOT RELEVANT]"
         print(f"{row['rank']}. {row['chunk_id']} | score={row['similarity_score']:.3f} | {is_relevant}")
-        
+
+    # 2b. Context Reranking
+    print("⸻")
+    print("STEP 2 — CONTEXT RERANKING")
+    print(f"Cross-encoder model: {CONFIG['RERANK_MODEL']}")
+    reranker = Reranker()
+    retrieved = reranker.rerank(qr.question, retrieved)
+    print(f"Re-scored and re-sorted {len(retrieved)} candidates by cross-encoder relevance.")
+
     # 4. Redundancy Analysis
     print("⸻\n4. Redundancy Analysis\n⸻")
     print("Identify duplicate or semantically similar information...")
@@ -295,7 +386,12 @@ def cmd_interactive():
     print(f"Top {CONFIG['MAX_CHUNKS']} candidates retrieved:")
     for i, row in retrieved.iterrows():
         print(f"{row['rank']}. {row['chunk_id']} | score={row['similarity_score']:.3f}")
-    
+
+    print("⸻\nSTEP 1b — CONTEXT RERANKING\n⸻")
+    reranker = Reranker()
+    retrieved = reranker.rerank(question, retrieved)
+    print(f"Re-scored and re-sorted {len(retrieved)} candidates by cross-encoder relevance.")
+
     print("⸻\nSTEP 2 — REDUNDANCY\n⸻")
     retrieved_embeddings = chunk_embeddings[retrieved.index.tolist()]
     retrieved_ids = retrieved["chunk_id"].tolist()
@@ -333,11 +429,11 @@ def cmd_interactive():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python main.py [setup|inspect|eda|demo|interactive]")
+        print("Usage: python main.py [setup|inspect|eda|demo|interactive|experiment] [--num-samples N]")
         sys.exit(1)
-        
+
     cmd = sys.argv[1]
-    
+
     if cmd == "setup":
         cmd_setup()
     elif cmd == "inspect":
@@ -348,6 +444,11 @@ def main():
         cmd_demo()
     elif cmd == "interactive":
         cmd_interactive()
+    elif cmd == "experiment":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--num-samples", type=int, default=None)
+        args = parser.parse_args(sys.argv[2:])
+        cmd_experiment(args.num_samples)
     else:
         print(f"Unknown command: {cmd}")
 

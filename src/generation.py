@@ -34,19 +34,30 @@ Instructions:
 5. Keep the answer concise but complete."""
 
     start_time = time.perf_counter()
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
     try:
         response = client.models.generate_content(
             model=model_name,
             contents=prompt,
         )
         answer = response.text
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+            completion_tokens = getattr(usage, "candidates_token_count", 0) or 0
+            total_tokens = getattr(usage, "total_token_count", 0) or (prompt_tokens + completion_tokens)
     except Exception as e:
         answer = f"Error generating answer: {str(e)}"
-        
+
     latency = time.perf_counter() - start_time
-    
+
     return {
         "answer": answer,
         "latency": latency,
-        "model": model_name
+        "model": model_name,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
     }

@@ -30,7 +30,7 @@ def load_qasper_dataset(split="validation"):
     else:
         json_filename = "qasper-train-v0.1.json"
         
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
     
     with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as tar:

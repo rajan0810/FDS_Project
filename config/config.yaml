@@ -23,3 +23,11 @@ MARGINAL_SCORE_THRESHOLD: 0.05
 
 # Gemini Configuration
 DEFAULT_GEMINI_MODEL: "gemini-3.1-pro-preview"
+
+# Reranking Configuration
+RERANK_MODEL: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_TOP_N: 15
+
+# Experiment Sweep Configuration (Context-vs-Accuracy / Latency / Cost-Quality Tradeoff)
+CONTEXT_SIZE_SWEEP: [2, 4, 6, 10]
+EXPERIMENT_NUM_SAMPLES: 20

@@ -43,22 +43,34 @@ python main.py inspect
 ```
 
 ### 3. Exploratory Data Analysis (EDA)
-Runs length and position analysis on the dataset and saves plots to `outputs/eda/figures/`.
+Runs the full EDA suite — Context Length, Relevance, Evidence Position, Redundancy, and Cross-Document Similarity analysis — and saves CSVs/plots to `outputs/eda/`.
 ```bash
 python main.py eda
 ```
 
-### 4. Interactive Demo
-Runs a complete end-to-end adaptive context selection pipeline for a single question.
+### 4. Pipeline Demo
+Runs a complete end-to-end adaptive context selection pipeline (retrieve -> rerank -> select -> deduplicate -> order -> generate) for a single question, comparing baseline vs. adaptive context.
 ```bash
 python main.py demo
 ```
 
+### 5. Interactive Demo
+Ask your own question about a randomly sampled paper and see each pipeline stage's output.
+```bash
+python main.py interactive
+```
+
+### 6. Experiment Sweep
+Runs the Context-vs-Accuracy, Latency, and Cost-Quality Tradeoff analyses across multiple context-size budgets on a sample of questions (makes real Gemini API calls). Results are saved to `outputs/experiments/`.
+```bash
+python main.py experiment --num-samples 20
+```
+
 ## Project Structure
-- `src/`: Core logic (preprocessing, chunking, embeddings, retrieval, selection, generation).
+- `src/`: Core logic (preprocessing, chunking, embeddings, retrieval, reranking, adaptive selection, redundancy removal, generation, evaluation, EDA, experiment sweeps).
 - `data/`: Caches and embeddings.
-- `outputs/`: Saved EDA plots, retrieval results, and experimental data.
+- `outputs/`: Saved EDA plots/CSVs and experiment sweep results.
 
 ## Limitations
 - **Prototype Status**: The adaptive selection heuristic is a prototype and not a learned policy.
-- **Evaluation**: The grounding metric uses exact string matching and overlap. More advanced LLM-as-a-judge could be added later.
+- **Evaluation**: The Groundedness metric is a lexical-overlap + embedding-similarity heuristic, not an LLM-as-a-judge; token counts use a word-count heuristic rather than the model's real tokenizer.

@@ -1,61 +1,80 @@
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Tuple
-from sklearn.metrics.pairwise import cosine_similarity
+from typing import Tuple
 from .config import CONFIG
+from .redundancy import flag_redundant_chunks
 
-def adaptive_select(retrieved_chunks: pd.DataFrame, 
-                    chunk_embeddings: np.ndarray, 
-                    global_metadata: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+def select_by_relevance(reranked_chunks: pd.DataFrame,
+                         min_relevance: float = None,
+                         max_chunks: int = None,
+                         min_chunks: int = None) -> pd.DataFrame:
     """
-    Prototype adaptive context selection heuristic.
-    Stops when marginal relevance is too low, or redundancy is too high, or budget met.
+    Adaptive Context Selection stage (relevance cutoff only).
+
+    Walks the reranked candidates in order and stops when either:
+      - `max_chunks` have been accepted, or
+      - the chunk's original bi-encoder `similarity_score` drops below `min_relevance`,
+        provided at least `min_chunks` have already been accepted.
+
+    Note: the *relevance* cutoff is applied against the bi-encoder cosine similarity score
+    (bounded in [0, 1], matching MIN_RELEVANCE_SCORE's calibration), not the cross-encoder
+    rerank score — the reranker only changes candidate *order/pool*, not the relevance
+    threshold semantics.
     """
-    min_chunks = CONFIG["MIN_CHUNKS"]
-    max_chunks = CONFIG["MAX_CHUNKS"]
-    min_relevance = CONFIG["MIN_RELEVANCE_SCORE"]
-    marginal_thresh = CONFIG["MARGINAL_SCORE_THRESHOLD"]
-    redundancy_thresh = CONFIG["REDUNDANCY_THRESHOLD"]
-    
-    selected_indices = []
-    selected_embeddings = []
-    removed_as_redundant = 0
-    
-    for idx, row in retrieved_chunks.iterrows():
-        global_idx = row.name # The index in retrieved_chunks should be the global index
-        
-        # Stop condition 1: Max chunks reached
-        if len(selected_indices) >= max_chunks:
+    if min_relevance is None:
+        min_relevance = CONFIG["MIN_RELEVANCE_SCORE"]
+    if max_chunks is None:
+        max_chunks = CONFIG["MAX_CHUNKS"]
+    if min_chunks is None:
+        min_chunks = CONFIG["MIN_CHUNKS"]
+
+    keep_positions = []
+    for pos in range(len(reranked_chunks)):
+        if len(keep_positions) >= max_chunks:
             break
-            
-        # Stop condition 2: Marginal relevance too low
-        if row["similarity_score"] < min_relevance:
-            if len(selected_indices) >= min_chunks:
-                break
-                
-        # If it's the first chunk, just add it
-        if len(selected_indices) == 0:
-            selected_indices.append(global_idx)
-            selected_embeddings.append(chunk_embeddings[global_idx])
-            continue
-            
-        # Stop condition 3 & Redundancy Check
-        curr_emb = chunk_embeddings[global_idx].reshape(1, -1)
-        sims_to_selected = cosine_similarity(curr_emb, selected_embeddings)[0]
-        
-        max_sim_to_selected = np.max(sims_to_selected)
-        
-        if max_sim_to_selected >= redundancy_thresh:
-            removed_as_redundant += 1
-            continue
-            
-        # Accept chunk
-        selected_indices.append(global_idx)
-        selected_embeddings.append(chunk_embeddings[global_idx])
-        
-    final_selected = global_metadata.loc[selected_indices].copy()
-    
-    # Sort by original position
-    final_selected = final_selected.sort_values(by="start_paragraph")
-    
+
+        row = reranked_chunks.iloc[pos]
+        if row["similarity_score"] < min_relevance and len(keep_positions) >= min_chunks:
+            break
+
+        keep_positions.append(pos)
+
+    return reranked_chunks.iloc[keep_positions].copy()
+
+def remove_redundant_chunks(selected_chunks: pd.DataFrame,
+                             chunk_embeddings: np.ndarray,
+                             redundancy_thresh: float = None) -> Tuple[pd.DataFrame, int]:
+    """
+    Redundancy Removal stage. Delegates to `src.redundancy.flag_redundant_chunks`.
+    `chunk_embeddings` must be the full corpus embedding matrix; rows are looked up by the
+    global index preserved on `selected_chunks`.
+    """
+    if len(selected_chunks) == 0:
+        return selected_chunks.copy(), 0
+
+    candidate_embeddings = chunk_embeddings[selected_chunks.index.to_numpy()]
+    return flag_redundant_chunks(selected_chunks, candidate_embeddings, redundancy_thresh)
+
+def order_context(chunks: pd.DataFrame) -> pd.DataFrame:
+    """
+    Context Ordering stage. Arranges the final selected evidence chunks in original
+    document order (by start paragraph), which mitigates "lost in the middle" effects
+    since the LLM sees evidence in the same narrative order as the source document.
+    """
+    if len(chunks) == 0:
+        return chunks.copy()
+    return chunks.sort_values(by="start_paragraph")
+
+def adaptive_select(retrieved_chunks: pd.DataFrame,
+                     chunk_embeddings: np.ndarray,
+                     global_metadata: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    """
+    Convenience wrapper chaining the three discrete stages:
+    select_by_relevance -> remove_redundant_chunks -> order_context.
+    Kept for backward compatibility with existing call sites.
+    """
+    relevance_selected = select_by_relevance(retrieved_chunks)
+    deduplicated, removed_as_redundant = remove_redundant_chunks(relevance_selected, chunk_embeddings)
+    final_selected = order_context(deduplicated)
+
     return final_selected, removed_as_redundant
